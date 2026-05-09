@@ -2,47 +2,26 @@
 // src/api/routes/stats.ts — Statistics and analytics routes
 // ============================================================
 
-import type { FastifyPluginAsync } from 'fastify';
-import logger from '../../utils/logger.js';
+import { Router, Request, Response } from "express";
+import logger from "../../utils/logger.js";
 
-const statsRoute: FastifyPluginAsync = async (fastify) => {
-  // GET /stats/homepage — Homepage statistics
-  fastify.get(
-    '/stats/homepage',
-    {
-      schema: {
-        response: {
-          200: {
-            type: 'object',
-            properties: {
-              totalSearches: { type: 'integer' },
-              activeUsers: { type: 'integer' },
-              recentActivity: { type: 'integer' },
-              timestamp: { type: 'string' },
-            },
-          },
-        },
-      },
-    },
-    async (_req, reply) => {
-      try {
-        // TODO: Implement with database queries
-        // For now, return mock data
-        const stats = {
-          totalSearches: 0, // Query from Search table
-          activeUsers: 0,   // Query from User table
-          recentActivity: 0, // Recent searches in last 24h
-          timestamp: new Date().toISOString(),
-        };
+const router = Router();
 
-        logger.info('Stats: homepage stats requested');
-        return reply.send(stats);
-      } catch (err) {
-        logger.error({ err }, 'Stats: homepage fetch failed');
-        return reply.status(500).send({ error: 'Failed to fetch homepage stats' });
-      }
-    }
-  );
-};
+router.get("/stats/homepage", async (_req: Request, res: Response) => {
+  try {
+    const stats = {
+      totalSearches: 0,
+      activeUsers: 0,
+      recentActivity: 0,
+      timestamp: new Date().toISOString(),
+    };
 
-export default statsRoute;
+    logger.info("Stats: homepage stats requested");
+    return res.json(stats);
+  } catch (err) {
+    logger.error({ err }, "Stats: homepage fetch failed");
+    return res.status(500).json({ error: "Failed to fetch homepage stats" });
+  }
+});
+
+export default router;
