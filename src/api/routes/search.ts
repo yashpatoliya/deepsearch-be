@@ -25,13 +25,18 @@ const SearchBodySchema = z.object({
     .default("full_name"),
   deep_mode: z.boolean().optional().default(true),
   max_results: z.number().int().min(1).max(50).optional().default(20),
+  advanced_search: z
+    .object({
+      location: z.string().max(100).optional(),
+      education: z.string().max(200).optional(),
+      professional_background: z.string().max(200).optional(),
+    })
+    .optional(),
   context_query: z.string().max(200).optional(),
   categories: z
     .array(
       z.enum([
         "social_media",
-        "photos",
-        "videos",
         "web_mentions",
         "education",
         "professional",
@@ -39,8 +44,6 @@ const SearchBodySchema = z.object({
         "family_relations",
         "business_profiles",
         "location_history",
-        "public_documents",
-        "news_mentions",
       ]),
     )
     .optional()
@@ -76,6 +79,14 @@ router.post("/search", async (req: Request, res: Response) => {
       maxResults: data.max_results,
       deepMode: data.deep_mode,
       contextQuery: data.context_query,
+      advancedSearch: data.advanced_search
+        ? {
+            location: data.advanced_search.location,
+            education: data.advanced_search.education,
+            professionalBackground:
+              data.advanced_search.professional_background,
+          }
+        : undefined,
     });
 
     return res.status(200).json({

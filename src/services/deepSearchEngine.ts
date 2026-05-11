@@ -24,6 +24,11 @@ export interface SearchJob {
   categories: string[];
   maxResults: number;
   deepMode: boolean;
+  advancedSearch?: {
+    location?: string;
+    education?: string;
+    professionalBackground?: string;
+  };
   contextQuery?: string;
   createdAt: Date;
   status: "queued" | "processing" | "completed" | "failed";
@@ -78,6 +83,10 @@ export interface SearchResult {
       source: string;
     }>;
     profileImages?: string[];
+  };
+  contactData?: {
+    emails?: string[];
+    phones?: string[];
   };
   publicMentions?: Array<{
     title: string;
@@ -148,6 +157,7 @@ export async function createSearchJob(params: {
   maxResults: number;
   deepMode: boolean;
   contextQuery?: string;
+  advancedSearch?: SearchJob["advancedSearch"];
 }): Promise<SearchJob> {
   const queue = initializeSearchQueue();
 
@@ -159,6 +169,7 @@ export async function createSearchJob(params: {
     maxResults: params.maxResults,
     deepMode: params.deepMode,
     contextQuery: params.contextQuery,
+    advancedSearch: params.advancedSearch,
     createdAt: new Date(),
     status: "queued",
   };
@@ -283,23 +294,25 @@ export function createSearchWorker() {
 
 // Execute the actual deep search using real data sources
 async function executeDeepSearch(job: SearchJob): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-
   try {
-    // Step 1: Search DuckDuckGo for relevant results
-    const searchResults = await searchRealData(job.query, job.searchType);
+    const advancedQuery = buildPersonSearchQuery(job.query, job.advancedSearch);
+    const searchResults = await searchRealData(advancedQuery, job.searchType);
 
-    // Step 2: Scrape and extract structured data from top results
+    const maxSearchPages = job.deepMode
+      ? Math.min(searchResults.length, job.maxResults * 4)
+      : job.maxResults;
+    const candidateResults = searchResults.slice(0, maxSearchPages);
+
     const scrapedData = await scrapeAndExtractData(
-      searchResults,
+      candidateResults,
       job.maxResults,
+      job.deepMode,
     );
 
-    // Step 3: Enrich data with category-specific information
     const enrichedResults = await enrichResultsByCategory(
       scrapedData,
       job.categories,
-      job.query,
+      advancedQuery,
     );
 
     return enrichedResults.slice(0, job.maxResults);
@@ -308,9 +321,24 @@ async function executeDeepSearch(job: SearchJob): Promise<SearchResult[]> {
       { error, query: job.query },
       "Deep Search: Failed to execute search",
     );
-    // Return empty results on failure
     return [];
   }
+}
+
+function buildPersonSearchQuery(
+  query: string,
+  advancedSearch?: SearchJob["advancedSearch"],
+) {
+  const advancedTerms = [
+    advancedSearch?.location,
+    advancedSearch?.education,
+    advancedSearch?.professionalBackground,
+  ]
+    .filter(Boolean)
+    .map((term) => term?.trim())
+    .filter(Boolean);
+
+  return [query.trim(), ...advancedTerms].filter(Boolean).join(" ");
 }
 
 // Search using DuckDuckGo API
@@ -378,10 +406,19 @@ async function searchRealData(
 async function scrapeAndExtractData(
   searchResults: any[],
   maxResults: number,
+  deepMode: boolean,
 ): Promise<SearchResult[]> {
   const extractedResults: SearchResult[] = [];
+  const seenUrls = new Set<string>();
+  const batchSize = Math.min(
+    searchResults.length,
+    deepMode ? maxResults * 4 : maxResults * 2,
+  );
 
-  for (const result of searchResults.slice(0, maxResults * 2)) {
+  for (const result of searchResults.slice(0, batchSize)) {
+    if (!result.url || seenUrls.has(result.url)) continue;
+    seenUrls.add(result.url);
+
     try {
       const pageContent = await scrapePageContent(result.url);
       if (!pageContent) continue;
@@ -400,6 +437,8 @@ async function scrapeAndExtractData(
       logger.warn({ url: result.url, error }, "Failed to scrape page");
       continue;
     }
+
+    if (extractedResults.length >= maxResults) break;
   }
 
   return extractedResults;
@@ -412,9 +451,11 @@ async function scrapePageContent(url: string): Promise<string> {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
-      timeout: 10000,
-      maxRedirects: 3,
+      timeout: 15000,
+      maxRedirects: 5,
     });
 
     return response.data;
@@ -433,33 +474,33 @@ function extractStructuredData(
 ): SearchResult | null {
   try {
     const $ = cheerio.load(html);
-
-    // Extract text content
-    const textContent = $("body").text().substring(0, 5000);
+    const bodyText = $("body").text();
+    const textContent = bodyText
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 12000);
 
     // Try to find social media links
     const socialProfiles: SearchResult["socialProfiles"] = [];
     const socialLinks =
       html.match(
-        /(linkedin|twitter|facebook|instagram|github)\.com\/[^\s"'<>]+/gi,
+        /(https?:\/\/)?(?:www\.)?(linkedin|twitter|facebook|instagram|github|tiktok|mastodon)\.[^\s"'<>]+/gi,
       ) || [];
 
-    const uniqueSocial = Array.from(new Set(socialLinks)).slice(0, 5);
-    for (const link of uniqueSocial) {
+    const uniqueSocial = Array.from(new Set(socialLinks)).slice(0, 8);
+    for (const rawLink of uniqueSocial) {
+      const link = rawLink.startsWith("http") ? rawLink : `https://${rawLink}`;
+      const hostname = new URL(link).hostname.replace("www.", "");
       const platform =
-        link.split(".")[0].charAt(0).toUpperCase() +
-        link.split(".")[0].slice(1);
-      socialProfiles.push({
-        platform,
-        url: link.startsWith("http") ? link : `https://${link}`,
-        username: link.split("/").pop() || "",
-      });
+        hostname.split(".")[0].charAt(0).toUpperCase() +
+        hostname.split(".")[0].slice(1);
+      const username = link.split("/").filter(Boolean).pop() || "";
+      socialProfiles.push({ platform, url: link, username });
     }
 
-    // Extract location information
     const locationData: SearchResult["locationData"] = {};
     const locationMatch = textContent.match(
-      /(based in|located in|from|city:|country:)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
+      /(based in|located in|from|city|country)\s*[:\-]?\s*([A-Z][a-zA-Z0-9 ,]+)/i,
     );
     if (locationMatch) {
       const parts = locationMatch[2].split(",");
@@ -467,46 +508,134 @@ function extractStructuredData(
       locationData.country = parts[1]?.trim();
     }
 
-    // Extract professional data
     const professionalData: SearchResult["professionalData"] = {};
     const companyMatch = textContent.match(
-      /(?:works at|company:|employer:)\s+([^\n.,]+)/i,
+      /(?:works at|company|employer|currently at)\s*[:\-]?\s*([^\n,.]+)/i,
     );
     if (companyMatch) {
       professionalData.currentCompany = companyMatch[1]
         .trim()
-        .substring(0, 100);
+        .substring(0, 120);
     }
 
-    // Extract skills
-    const skillMatches = textContent.match(
-      /(?:skills?:|expertise:)\s*([^\n.]+)/i,
+    const skillMatches = Array.from(
+      new Set(
+        [
+          ...textContent.matchAll(
+            /(?:skills|expertise|specializations?)\s*[:\-]?\s*([^\n.]+)/gi,
+          ),
+        ].map((m) => m[1]),
+      ),
     );
-    if (skillMatches) {
-      professionalData.skills = skillMatches[1]
+    if (skillMatches.length > 0) {
+      professionalData.skills = skillMatches
+        .join(", ")
         .split(/[,;]/)
         .map((s) => s.trim())
-        .filter((s) => s.length > 0)
-        .slice(0, 10);
+        .filter(Boolean)
+        .slice(0, 12);
     }
 
-    // Extract media URLs
+    const educationMatches = Array.from(
+      new Set(
+        [
+          ...textContent.matchAll(
+            /(?:education|university|college|school|degree|mba|phd)\s*[:\-]?\s*([^\n.]{5,120})/gi,
+          ),
+        ].map((m) => m[1]),
+      ),
+    );
+    if (educationMatches.length > 0) {
+      professionalData.education = educationMatches.slice(0, 5).map((text) => ({
+        institution: text.trim().substring(0, 100),
+        degree: text.trim().substring(0, 100),
+      }));
+    }
+
+    const contactData: SearchResult["contactData"] = {};
+    const emailMatches = Array.from(
+      new Set(
+        (
+          html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []
+        ).slice(0, 6),
+      ),
+    );
+    const phoneMatches = Array.from(
+      new Set((textContent.match(/\+?\d[\d()\- ]{7,}\d/g) || []).slice(0, 6)),
+    );
+    if (emailMatches.length > 0) contactData.emails = emailMatches;
+    if (phoneMatches.length > 0) contactData.phones = phoneMatches;
+
     const media: SearchResult["media"] = {};
-    const imgUrls =
-      html.match(/https?:\/\/[^\s"<>]*\.(?:jpg|jpeg|png|webp|gif)/gi) || [];
+    const imgUrls = Array.from(
+      new Set(
+        html.match(/https?:\/\/(?:[^"\s<>]+)\.(?:jpg|jpeg|png|webp|gif)/gi) ||
+          [],
+      ),
+    ).slice(0, 12);
     if (imgUrls.length > 0) {
-      media.profileImages = Array.from(new Set(imgUrls)).slice(0, 10);
+      media.profileImages = imgUrls;
+      media.photos = imgUrls.map((imgUrl) => ({
+        url: imgUrl,
+        source: new URL(imgUrl).hostname,
+      }));
     }
 
-    // Build confidence scores based on data availability
+    const relationshipSignals: SearchResult["relationshipSignals"] = {};
+    const contactPeople = Array.from(
+      new Set(
+        [
+          ...textContent.matchAll(
+            /(?:works with|founder of|partnered with|spouse|wife|husband|daughter|son|mother|father)\s*([A-Z][a-zA-Z ]{2,80})/gi,
+          ),
+        ].map((m) => m[1].trim()),
+      ),
+    ).slice(0, 8);
+    if (contactPeople.length > 0) {
+      relationshipSignals.associatedPeople = contactPeople.map((name) => ({
+        name,
+        relationship: "associated",
+        context: `Mentioned in page content near ${name}`,
+      }));
+    }
+
+    const businessMatches = Array.from(
+      new Set(
+        [
+          ...textContent.matchAll(
+            /(?:co-founder of|executive at|cto of|ceo of|founder of)\s*([A-Z][a-zA-Z &]{2,80})/gi,
+          ),
+        ].map((m) => m[1].trim()),
+      ),
+    ).slice(0, 6);
+    if (businessMatches.length > 0) {
+      relationshipSignals.businessRelations = businessMatches;
+    }
+
+    const mentions: SearchResult["publicMentions"] = [
+      {
+        title: title || snippet || new URL(url).hostname,
+        url,
+        snippet: snippet || textContent.substring(0, 220),
+        source: new URL(url).hostname || "Web",
+        publishedDate: new Date().toISOString(),
+      },
+    ];
+
     const dataFields = [
       socialProfiles.length > 0,
       Object.keys(professionalData).length > 0,
       Object.keys(locationData).length > 0,
+      (contactData.emails?.length || 0) > 0,
+      (contactData.phones?.length || 0) > 0,
       (media.profileImages?.length || 0) > 0,
+      (relationshipSignals.associatedPeople?.length || 0) > 0,
     ].filter(Boolean).length;
 
-    const matchPercentage = Math.min(100, 40 + dataFields * 15);
+    const matchPercentage = Math.min(
+      100,
+      35 + dataFields * 10 + (mentions.length > 0 ? 10 : 0),
+    );
 
     const result: SearchResult = {
       identity: {
@@ -518,18 +647,16 @@ function extractStructuredData(
       locationData:
         Object.keys(locationData).length > 0 ? locationData : undefined,
       media: Object.keys(media).length > 0 ? media : undefined,
-      publicMentions: [
-        {
-          title,
-          url,
-          snippet,
-          source: new URL(url).hostname || "Web",
-          publishedDate: new Date().toISOString(),
-        },
-      ],
+      contactData:
+        Object.keys(contactData).length > 0 ? contactData : undefined,
+      relationshipSignals:
+        Object.keys(relationshipSignals).length > 0
+          ? relationshipSignals
+          : undefined,
+      publicMentions: mentions,
       confidenceScores: {
         matchPercentage,
-        sourceQuality: Math.min(10, 5 + dataFields),
+        sourceQuality: Math.min(10, 4 + dataFields),
         confidenceLevel:
           matchPercentage > 75
             ? "high"
@@ -545,7 +672,6 @@ function extractStructuredData(
     return null;
   }
 }
-
 // Format search query based on search type
 function formatSearchQuery(query: string, searchType: string): string {
   switch (searchType) {
@@ -571,9 +697,8 @@ async function enrichResultsByCategory(
   query: string,
 ): Promise<SearchResult[]> {
   return results.map((result) => {
-    const enhanced = { ...result };
+    const enhanced: SearchResult = { ...result };
 
-    // Add category-specific data
     for (const category of categories) {
       switch (category) {
         case "social_media":
@@ -588,7 +713,41 @@ async function enrichResultsByCategory(
           break;
         case "location_history":
           if (!enhanced.locationData) {
-            enhanced.locationData = { country: "Unknown", city: "Unknown" };
+            enhanced.locationData = {
+              country: "Unknown",
+              city: "Unknown",
+            };
+          }
+          break;
+        case "web_mentions":
+          if (!enhanced.publicMentions) {
+            enhanced.publicMentions = [
+              {
+                title: `Web search for ${query}`,
+                url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
+                snippet: "Open the search page to find related web mentions.",
+                source: "DuckDuckGo",
+                publishedDate: new Date().toISOString(),
+              },
+            ];
+          }
+          break;
+        case "education":
+          if (!enhanced.professionalData) {
+            enhanced.professionalData = searchForProfessionalData(query);
+          }
+          break;
+        case "news_mentions":
+          if (!enhanced.publicMentions) {
+            enhanced.publicMentions = [
+              {
+                title: `News search for ${query}`,
+                url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}+news`,
+                snippet: "View current news coverage for this query.",
+                source: "DuckDuckGo News",
+                publishedDate: new Date().toISOString(),
+              },
+            ];
           }
           break;
       }
@@ -605,7 +764,7 @@ function searchForSocialProfiles(
   return [
     {
       platform: "LinkedIn",
-      url: `https://linkedin.com/search/results/people/?keywords=${encodeURIComponent(query)}`,
+      url: `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(query)}`,
       username: query.toLowerCase(),
     },
     {
@@ -618,6 +777,11 @@ function searchForSocialProfiles(
       url: `https://github.com/search?q=${encodeURIComponent(query)}&type=users`,
       username: query.toLowerCase(),
     },
+    {
+      platform: "Instagram",
+      url: `https://www.instagram.com/${encodeURIComponent(query)}`,
+      username: query.toLowerCase(),
+    },
   ];
 }
 
@@ -628,6 +792,7 @@ function searchForProfessionalData(
   return {
     publicResumes: [
       `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(query)}`,
+      `https://www.google.com/search?q=${encodeURIComponent(query)}+resume`,
     ],
   };
 }
